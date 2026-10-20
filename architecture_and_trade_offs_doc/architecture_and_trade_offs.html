@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Architecture & Trade-Offs: Core Account Ledger</title>
+<style>
+  @page {
+    size: A4;
+    margin: 18mm 16mm 18mm 16mm;
+    @bottom-right {
+      content: counter(page) " of " counter(pages);
+      font-size: 8pt;
+      color: #666;
+    }
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 9.5pt;
+    line-height: 1.45;
+    color: #1a1a1a;
+    margin: 0;
+    padding: 0;
+  }
+
+  .page-section {
+    page-break-after: always;
+  }
+  .page-section:last-child {
+    page-break-after: avoid;
+  }
+
+  h1 {
+    font-size: 18pt;
+    font-weight: 700;
+    color: #0f172a;
+    margin-top: 0;
+    margin-bottom: 4px;
+    border-bottom: 2px solid #2563eb;
+    padding-bottom: 6px;
+  }
+
+  .meta-banner {
+    display: flex;
+    justify-content: space-between;
+    background-color: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 4px;
+    padding: 6px 12px;
+    margin-bottom: 16px;
+    font-size: 8.5pt;
+    color: #475569;
+  }
+  .meta-banner strong {
+    color: #0f172a;
+  }
+
+  h2 {
+    font-size: 13pt;
+    font-weight: 700;
+    color: #1e3a8a;
+    border-bottom: 1px solid #cbd5e1;
+    padding-bottom: 4px;
+    margin-top: 14px;
+    margin-bottom: 8px;
+  }
+
+  h3 {
+    font-size: 10.5pt;
+    font-weight: 600;
+    color: #0f172a;
+    margin-top: 10px;
+    margin-bottom: 4px;
+  }
+
+  p {
+    margin-top: 0;
+    margin-bottom: 8px;
+    text-align: justify;
+  }
+
+  ul, ol {
+    margin-top: 0;
+    margin-bottom: 8px;
+    padding-left: 20px;
+  }
+
+  li {
+    margin-bottom: 4px;
+  }
+
+  code {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 8.5pt;
+    background-color: #f1f5f9;
+    padding: 1px 4px;
+    border-radius: 3px;
+    color: #0f172a;
+  }
+
+  pre {
+    background-color: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-left: 3px solid #2563eb;
+    padding: 8px 12px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 8pt;
+    line-height: 1.35;
+    border-radius: 3px;
+    margin: 8px 0;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 10px 0;
+    font-size: 8.5pt;
+  }
+
+  th, td {
+    border: 1px solid #cbd5e1;
+    padding: 6px 8px;
+    text-align: left;
+    vertical-align: top;
+  }
+
+  th {
+    background-color: #f1f5f9;
+    color: #0f172a;
+    font-weight: 600;
+  }
+
+  tr:nth-child(even) td {
+    background-color: #f8fafc;
+  }
+
+  .callout {
+    background-color: #eff6ff;
+    border: 1px solid #bfdbfe;
+    border-left: 4px solid #2563eb;
+    padding: 8px 12px;
+    border-radius: 4px;
+    margin: 10px 0;
+    font-size: 8.5pt;
+  }
+  .callout strong {
+    color: #1e40af;
+  }
+</style>
+</head>
+<body>
+
+<!-- ========================================================================= -->
+<!-- PAGE 1: APPEND-ONLY AT SCALE                                              -->
+<!-- ========================================================================= -->
+<div class="page-section">
+  <h1>Architecture & Trade-Offs: Core Account Ledger</h1>
+  <div class="meta-banner">
+    <div><strong>Classification:</strong> Production Architecture Review</div>
+    <div><strong>Domain:</strong> Core Banking & Clearing</div>
+    <div><strong>Regulator:</strong> CBUAE (United Arab Emirates)</div>
+  </div>
+
+  <h2>1. Append-Only at Scale</h2>
+
+  <h3>What Breaks First at 100× Volume?</h3>
+  <p>
+    In an event-driven core ledger, monetary balances are modeled across posting phase dimensions (<code>COMMITTED</code>, <code>PENDING_OUTGOING</code>) and stored as point-in-time balance time-series to guarantee <code>O(1)</code> read throughput for payment authorization and balance inquiry APIs. When transaction velocity scales 100×—from thousands to hundreds of millions of postings—two structural bottlenecks immediately manifest:
+  </p>
+  <ul>
+    <li>
+      <strong>Write Amplification on Backdated Postings:</strong> When an event arrives with a past effective value date (e.g., an automated batch clearing adjustment or retrospective fee), the engine must propagate the net delta forward across all subsequent balance intervals up to the active timestamp. On high-throughput accounts (such as payment gateway merchant settlement or corporate liquidity accounts with 50,000+ daily events), backdating an entry by just 5 calendar days forces the ledger to update or split hundreds of thousands of historical balance intervals. At 100× volume, this forward cascade generates catastrophic database lock escalation, write amplification, and transaction log starvation.
+    </li>
+    <li>
+      <strong>Read Latency on Un-Checkpointd Replay Streams:</strong> If the engine avoids interval updating by re-calculating balances on the fly from raw append-only event logs, query latency degrades as <code>O(N)</code>. Core payment gateways and ATM switches enforce strict &lt;50ms response SLAs; linear historical scans across millions of events quickly exhaust worker pools and trigger upstream circuit breakers.
+    </li>
+  </ul>
+
+  <h3>Where Does the Design Accumulate Unbounded State?</h3>
+  <p>
+    The initial in-memory implementation accumulates state linearly and monotonically across three dimensions:
+  </p>
+  <ul>
+    <li><strong>Immutable Event Store:</strong> The slice of append-only <code>LedgerEntry</code> records grows indefinitely without automated pruning, tiered archiving, or compaction.</li>
+    <li><strong>Dormant Hold Registries:</strong> Authorization holds remain indexed in active memory indefinitely even after reaching terminal lifecycle states (<code>SETTLED</code> or <code>REJECTED</code>).</li>
+    <li><strong>Balance Time-Series:</strong> Retaining high-resolution intra-day balance records across multi-year account histories consumes unbounded heap memory.</li>
+  </ul>
+
+  <h3>The Cheapest Structural Change That Defers the Problem</h3>
+  <p>
+    The most cost-effective and resilient structural enhancement is pairing <strong>Periodic Balance Checkpointing</strong> with a strict <strong>Value-Dating Window Boundary</strong>:
+  </p>
+  <pre>
+[Raw Event Ingestion]
+        │
+        ▼
+[Periodic Balance Checkpoint (EOD / Monthly)] ──► [Bounded Window (T - 30 Days)] ──► Live Balance O(1)
+        ▲
+        └──────────────── Bounded Forward Propagation (Max 30 Days) ────────────────┘</pre>
+  <ul>
+    <li>
+      <strong>EOD & Monthly Checkpointing:</strong> At each End-of-Day (EOD) and monthly accounting close, the ledger freezes cumulative balances into a permanent checkpoint snapshot. Historical point-in-time balance queries resolve instantly by reading the nearest checkpoint plus localized intra-day deltas, preserving <code>O(1)</code> query response.
+    </li>
+    <li>
+      <strong>Enforced Backdating Window (<code>T - k</code>):</strong> The ingestion gateway mandates a structural cutoff (e.g., <code>k = 30</code> calendar days). Postings carrying value dates older than <code>T - k</code> are rejected by automated pipelines and diverted to specialized exception adjustment workflows. This bounds the maximum forward propagation cascade to at most <code>k</code> days, capping write amplification at an upper bound regardless of how many millions of events the account has historically accumulated.
+    </li>
+  </ul>
+</div>
+
+<!-- ========================================================================= -->
+<!-- PAGE 2: VALUE-DATED ENTRIES IN PRODUCTION                                  -->
+<!-- ========================================================================= -->
+<div class="page-section">
+  <h2>2. Value-Dated Entries in Production (UAE-Licensed Bank)</h2>
+
+  <h3>Operational and Regulatory Surface in a CBUAE Environment</h3>
+  <p>
+    Within the regulatory jurisdiction of the Central Bank of the UAE (CBUAE), value-dated entries introduce critical regulatory exposure, liquidity risk, and consumer protection friction:
+  </p>
+  <ul>
+    <li>
+      <strong>Prudential Liquidity & Daily Regulatory Returns:</strong> Under CBUAE Regulations Regarding Liquidity Risk (Circular No. 33/2015), licensed commercial banks must compute and report the <strong>Liquidity Coverage Ratio (LCR)</strong> and the <strong>Eligible Liquid Assets Ratio (ELAR)</strong> on a daily basis. Value-dated debits retroactively decrease the bank's historical customer deposit liabilities. If a corporate debit of AED 100,000,000 is backdated by 3 business days, the bank's previously certified regulatory filings for Days <code>T-3</code>, <code>T-2</code>, and <code>T-1</code> were retroactively inaccurate. Such discrepancies distort the bank's high-quality liquid assets (HQLA) baseline and expose the institution to regulatory audits, mandatory capital surcharges, and supervisory penalties.
+    </li>
+    <li>
+      <strong>Customer Statement Truth & Consumer Protection:</strong> The CBUAE Consumer Protection Regulation (Circular No. 8/2020) mandates that customer account statements be transparent, finalized, and legally binding. Injecting a backdated posting into a closed monthly accounting period causes the customer's legal statement to diverge from the core ledger. In the UAE retail sector, this triggers formal complaints to <strong>Sanadak</strong> (the Ombudsman Unit for Financial and Insurance Disputes), resulting in dispute arbitration penalties and reputational harm.
+    </li>
+    <li>
+      <strong>Retroactive Overdraft Fees & Sharia Compliance:</strong> In Islamic banking windows operating under Higher Sharia Authority (HSA) guidelines, assessing retroactive penalties or compensatory fees on historical deficits is strictly non-compliant with Islamic finance tenets (prohibition of Riba). In conventional banking, penalizing retail consumers retroactively for an unarranged overdraft that was impossible to observe or mitigate in real time breaches CBUAE consumer fairness standards.
+    </li>
+  </ul>
+
+  <h3>The One Control to Add Before Going Live</h3>
+  <div class="callout">
+    <strong>Mandatory Production Control:</strong> <em>Pre-Settlement Value-Dating Boundary with Dual-Authorization (Maker-Checker) Quarantine Workflow</em>
+  </div>
+  <p>
+    Before deploying to production, a strict <strong>Value-Date Quarantine Gateway</strong> must be enforced at the ledger ingestion boundary:
+  </p>
+  <ul>
+    <li>
+      <strong>Automated Gateway Threshold (<code>T - 2</code>):</strong> Automated clearing channels (UAE Funds Transfer System - UAEFTS, Instant Payments Platform - Aani, Image Cheque Clearing System, and Visa/Mastercard presentment) are permitted an automated backdating tolerance of at most 2 business days.
+    </li>
+    <li>
+      <strong>Quarantine Interceptor (&gt; <code>T - 2</code> or Closed Cycles):</strong> Any inbound posting instruction referencing a value date older than 2 business days—or falling into a previously finalized monthly statement period—is blocked by automated execution pipelines and routed to a quarantine suspense queue.
+    </li>
+    <li>
+      <strong>Maker-Checker Operational Approval:</strong> Quarantined postings cannot post directly to customer liability accounts. A Financial Operations Officer (Maker) and a Compliance Officer (Checker) must explicitly review the retroactive liquidity impact on daily LCR metrics and sign off on a compensatory General Ledger adjustment entry rather than executing an unmonitored backdated write.
+    </li>
+  </ul>
+</div>
+
+<!-- ========================================================================= -->
+<!-- PAGE 3: AUTHORIZATION LIFECYCLE                                            -->
+<!-- ========================================================================= -->
+<div class="page-section">
+  <h2>3. Authorization Lifecycle</h2>
+  <p>
+    In our posting model, an authorization reserves purchasing power by recording an allocation in the <code>PENDING_OUTGOING</code> phase without debiting the <code>COMMITTED</code> ledger balance. While a standard transaction ends with a matching settlement, production banking mandates strict handling for five alternative termination lifecycles:
+  </p>
+
+  <h3>1. TTL Expiration (Time-To-Live Timeout)</h3>
+  <ul>
+    <li><strong>Real-World Scenario:</strong> A customer checks into a hotel or rents a vehicle, and a pre-authorization hold of AED 1,000.00 is placed on their card. At checkout, the customer pays the final folio using cash or an alternative corporate card. The merchant never transmits an explicit cancellation message.</li>
+    <li><strong>Mandated System Behavior:</strong> An automated EOD daemon scans all active authorizations. If a hold remains in <code>PENDING_OUTGOING</code> past its scheme-mandated TTL (e.g., 7 days for retail POS, 30 days for vehicle rental/hotel), the system transitions the hold to <code>EXPIRED</code>, deducts the hold amount from <code>PENDING_OUTGOING</code>, and immediately restores customer <code>AvailableBalance</code>.</li>
+  </ul>
+
+  <h3>2. Merchant Reversal / POS Void</h3>
+  <ul>
+    <li><strong>Real-World Scenario:</strong> An automated fuel dispenser pre-authorizes AED 200.00. The pump handle is hung up immediately without dispensing fuel, or a grocery store cashier voids a purchase at the checkout register. The terminal generates an immediate ISO 8583 reversal notification (0400/0420).</li>
+    <li><strong>Mandated System Behavior:</strong> The engine matches the incoming reversal against the original <code>AuthID</code>, transitions the hold status to <code>RELEASED</code>, and decrements <code>PENDING_OUTGOING</code> in real time (&lt;100ms), restoring purchasing power with zero impact on <code>COMMITTED</code> ledger balance.</li>
+  </ul>
+
+  <h3>3. Partial Settlement with Residual Release</h3>
+  <ul>
+    <li><strong>Real-World Scenario:</strong> An e-commerce merchant pre-authorizes an order for AED 500.00. One item priced at AED 150.00 is out of stock. The merchant ships the available items and transmits a final clearing settlement presentment of AED 350.00 with the <code>final_presentment</code> flag enabled.</li>
+    <li><strong>Mandated System Behavior:</strong> The engine debits AED 350.00 to <code>COMMITTED</code>, marks the authorization hold as <code>SETTLED</code>, and automatically releases the residual AED 150.00 hold from <code>PENDING_OUTGOING</code>, preventing funds from remaining needlessly locked.</li>
+  </ul>
+
+  <h3>4. Incremental Authorization (Hold Upsizing)</h3>
+  <ul>
+    <li><strong>Real-World Scenario:</strong> A customer at a restaurant authorizes AED 250.00 for a meal and subsequently adds an AED 50.00 gratuity at checkout, or a hotel guest extends their reservation by two additional nights.</li>
+    <li><strong>Mandated System Behavior:</strong> Rather than spawning an unlinked secondary authorization, the engine accepts an incremental authorization instruction referencing the active <code>AuthID</code>. The engine evaluates:
+      <code>AvailableBalance &gt;= incremental_amount</code>. If approved, <code>PENDING_OUTGOING</code> increases from AED 250.00 to AED 300.00 under the same hold entity.
+    </li>
+  </ul>
+
+  <h3>5. Administrative / Anti-Fraud Termination</h3>
+  <ul>
+    <li><strong>Real-World Scenario:</strong> The bank’s real-time fraud monitoring engine detects that a compromised card credential was utilized in an unauthorized overseas transaction, placing an active authorization hold minutes earlier.</li>
+    <li><strong>Mandated System Behavior:</strong> Fraud Operations triggers an emergency administrative termination. The engine transitions the hold to <code>BLOCKED_FRAUD</code>, removes the hold from <code>PENDING_OUTGOING</code>, freezes the payment token, and routes any subsequent settlement presentment into dispute chargeback queues.</li>
+  </ul>
+</div>
+
+<!-- ========================================================================= -->
+<!-- PAGE 4: WHAT WAS CUT AND WHY                                               -->
+<!-- ========================================================================= -->
+<div class="page-section">
+  <h2>4. What Was Cut and Why</h2>
+  <p>
+    To implement a robust, mathematically rigorous core ledger within the project scope, deliberate simplifications were enacted. Every cut represents a conscious engineering trade-off that defers specific operational risks:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th style="width: 22%;">Simplified Component</th>
+        <th style="width: 26%;">In-Memory Implementation</th>
+        <th style="width: 26%;">Production Target</th>
+        <th style="width: 26%;">Deferred Production Risk</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Consensus &amp; Storage</strong></td>
+        <td>Single-node append-only memory slice</td>
+        <td>Distributed commit log (Kafka) + Spanner / CockroachDB</td>
+        <td>Defers distributed split-brain recovery, network partitions, 2-phase commit (2PC) failures, and Raft log compaction.</td>
+      </tr>
+      <tr>
+        <td><strong>EOD Scheduling</strong></td>
+        <td>Synchronous replay loop invocation</td>
+        <td>Asynchronous distributed workflow (Temporal / Cloud Scheduler)</td>
+        <td>Defers job executor heartbeats, missed midnight cron triggers, UTC vs. GST timezone drift, and distributed retry idempotency.</td>
+      </tr>
+      <tr>
+        <td><strong>Accounting Integrity</strong></td>
+        <td>Single-entry customer deposit liabilities</td>
+        <td>Balanced multi-legged General Ledger ($A = L + E$)</td>
+        <td>Defers balancing institutional GL accounts (Due from Central Bank, Interchange Clearing, Fee Income) and GL reconciliation loops.</td>
+      </tr>
+      <tr>
+        <td><strong>Concurrency Control</strong></td>
+        <td>Deterministic sequential stream processing</td>
+        <td>Optimistic Concurrency Control (OCC) / Row locks</td>
+        <td>Defers database lock contention, transaction deadlocks, and OCC serialization retry overhead.</td>
+      </tr>
+      <tr>
+        <td><strong>Multi-Currency</strong></td>
+        <td>Isolated precision (AED: 2 decimals, BHD: 3 decimals)</td>
+        <td>Real-time FX treasury engine with live rate feeds</td>
+        <td>Defers real-time exchange rate slippage, cross-currency settlement risk, and intra-day foreign exchange revaluations.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Concurrency Vulnerability Analysis (Design Flaw Correlation)</h3>
+  <p>
+    As documented in our intentional failing test <code>TestDesignFlaw_ConcurrentAuthorizationRaceBreachesAvailableBalance</code>, sequential in-memory execution defers thread synchronization primitives. Under high-throughput multi-threaded ingestion:
+  </p>
+  <ul>
+    <li>An account begins with an available balance of <strong>AED 200.00</strong>.</li>
+    <li>Two concurrent authorization threads each request a hold of <strong>AED 150.00</strong>.</li>
+    <li>Both threads evaluate <code>GetAvailableBalance()</code> concurrently, both observe <code>200.00 &gt;= 150.00</code>, both approve the hold, and the account’s available balance plunges to <strong>-AED 100.00</strong>.</li>
+  </ul>
+  <p>
+    This breaches the non-negotiable core invariant: <em>"An authorization is approved only if available balance remains at or above zero."</em>
+  </p>
+  <p>
+    <strong>Production Mitigation:</strong> In a live distributed banking platform, this risk is mitigated by partitioning accounts across single-threaded deterministic actor queues or by enforcing <strong>Optimistic Concurrency Control (OCC)</strong> with account version stamps (<code>version_id</code>), ensuring that concurrent mutations abort and retry cleanly.
+  </p>
+</div>
+
+</body>
+</html>
