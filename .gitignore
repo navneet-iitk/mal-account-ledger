@@ -1,0 +1,8 @@
+# Binaries and archives
+*.exe
+*.zip
+*.pdf
+
+# Intermediate build artifacts
+*.html
+generate_pdf.py
