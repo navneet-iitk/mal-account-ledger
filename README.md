@@ -82,6 +82,7 @@ Each day (Day 1 through Day 6) outputs a structured report containing four requi
 
 ```
 mal.ai/
+├── .gitignore                 # Excluded build artifacts (*.pdf, *.html)
 ├── README.md                  # This file: execution guide and architecture summary
 ├── NUMBERS.md                 # Mathematical and economic justification for every constant
 ├── AMBIGUITIES.md             # 7 core banking ambiguities surfaced and resolved
@@ -98,9 +99,7 @@ mal.ai/
 │       ├── ledger_test.go     # Comprehensive unit test suite (all passing)
 │       └── design_flaw_test.go# Annotated failing tests exposing architectural trade-offs
 └── architecture_and_trade_offs_doc/
-    ├── PROBLEM_STATEMENT.md   # Part 2 requirements
-    ├── ARCHITECTURE_AND_TRADE_OFFS.md # 4 required architectural sections
-    └── ARCHITECTURE_AND_TRADE_OFFS.pdf# Compiled 2-4 page deliverable PDF
+    └── ARCHITECTURE_AND_TRADE_OFFS.md # 4 required architectural sections (compiled to PDF)
 ```
 
 ---
